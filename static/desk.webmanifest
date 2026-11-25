@@ -1,0 +1,14 @@
+{
+  "id": "/",
+  "name": "Price Action Desk",
+  "short_name": "Price Desk",
+  "lang": "th",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101614",
+  "theme_color": "#101614",
+  "icons": [
+    { "src": "/static/desk-icon.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

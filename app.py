@@ -1,8 +1,11 @@
 """Launch the local Price Action Desk. Python 3.11+; no web dependencies."""
 
 import argparse
+import ipaddress
 import json
+import re
 import socket
+import ssl
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,14 +22,80 @@ MAX_BODY = 1_700_000
 COOKIE = "price_desk_session"
 ASSETS = {"/": ("index.html", "text/html"), "/static/app.js": ("app.js", "text/javascript"),
           "/static/chart.js": ("chart.js", "text/javascript"),
-          "/static/styles.css": ("styles.css", "text/css")}
+          "/static/styles.css": ("styles.css", "text/css"),
+          "/desk.webmanifest": ("desk.webmanifest", "application/manifest+json"),
+          "/static/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+          "/static/desk-icon.png": ("desk-icon.png", "image/png")}
+
+
+LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+PRIVATE_LANS = tuple(ipaddress.IPv4Network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def tailnet_origin(value):
+    # Only the exact HTTPS Tailscale Serve hostname is intended as a browser entry point.
+    match = re.fullmatch(rf"https://((?:{LABEL}\.)+ts\.net)(?::([1-9][0-9]{{0,4}}))?", value.lower())
+    if match is None or len(match[1]) > 253:
+        raise ValueError("--proxy-origin requires an exact https://hostname.ts.net[:port] origin")
+    port = int(match[2] or 443)
+    if port > 65535:
+        raise ValueError("invalid proxy origin port")
+    return "https://" + match[1] + (f":{port}" if port != 443 else "")
 
 
 class DeskServer(ThreadingHTTPServer):
-    def __init__(self, port, password):
-        super().__init__(("127.0.0.1", port), Handler)
+    def __init__(self, port, password, *, bind="127.0.0.1", name=None, tls_cert=None, tls_key=None,
+                 proxy_origin=None):
+        address = ipaddress.IPv4Address(bind)
+        if not address.is_loopback and not any(address in net for net in PRIVATE_LANS):
+            raise ValueError("--bind must be a loopback or private LAN IPv4 address")
+        if bool(tls_cert) != bool(tls_key):
+            raise ValueError("--tls-cert and --tls-key must be supplied together")
+        if not address.is_loopback and not tls_cert:
+            raise ValueError("a LAN listener requires a TLS certificate and key")
+        if name and not re.fullmatch(rf"{LABEL}\.local", name.lower()):
+            raise ValueError("--name must be the Mac's exact .local hostname")
+        if proxy_origin and (not address.is_loopback or tls_cert or name):
+            raise ValueError("--proxy-origin requires a dedicated plain HTTP loopback listener")
+
+        self.proxy_origin = tailnet_origin(proxy_origin) if proxy_origin else None
+        self.tls_context = None
+        if tls_cert:
+            self.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            self.tls_context.load_cert_chain(tls_cert, tls_key)
+        self.secure_cookie = bool(self.proxy_origin or self.tls_context)
+        super().__init__((str(address), port), Handler)
         self.sessions = Sessions(password)
-        self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
+        names = {str(address)}
+        if address.is_loopback:
+            names.add("localhost")
+        if name:
+            names.add(name.lower())
+        scheme = "https" if self.tls_context else "http"
+        default_port = 443 if self.tls_context else 80
+        suffix = "" if self.server_port == default_port else f":{self.server_port}"
+        self.url = self.proxy_origin or f"{scheme}://{name or address}{suffix}"
+        self.origins = {}
+        for hostname in names:
+            origin = self.proxy_origin or f"{scheme}://{hostname}{suffix}"
+            self.origins[f"{hostname}:{self.server_port}"] = origin
+            if self.server_port == default_port:
+                self.origins[hostname] = origin
+        if self.proxy_origin:
+            public = urlsplit(self.proxy_origin)
+            self.origins[public.netloc] = self.proxy_origin
+            if public.port is None:
+                self.origins[f"{public.hostname}:443"] = self.proxy_origin
+        # No forwarded header defines a trusted host or origin. Tailscale Serve may
+        # retain the public Host or rewrite it to the configured loopback backend.
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        if self.tls_context:
+            # A slow TLS handshake must not block accept() for other devices.
+            conn = self.tls_context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+        return conn, addr
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,7 +114,8 @@ class Handler(BaseHTTPRequestHandler):
         data = (json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
                 if content_type == "application/json" else body)
         self.send_response(code)
-        self.send_header("Content-Type", content_type + "; charset=utf-8")
+        charset = "; charset=utf-8" if content_type.startswith("text/") or content_type == "application/json" else ""
+        self.send_header("Content-Type", content_type + charset)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -54,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
         if cookie is not None:
             age = self.server.sessions.lifetime if cookie else 0
-            self.send_header("Set-Cookie", f"{COOKIE}={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}")
+            secure = "; Secure" if self.server.secure_cookie else ""
+            self.send_header("Set-Cookie", f"{COOKIE}={cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}{secure}")
         self.end_headers()
         self.wfile.write(data)
 
@@ -67,10 +138,11 @@ class Handler(BaseHTTPRequestHandler):
         return jar[COOKIE].value if COOKIE in jar else ""
 
     def local_request(self, write=False):
-        host = self.headers.get("Host", "")
-        origin = self.headers.get("Origin")
-        if host not in self.server.hosts or (write and origin and origin != "http://" + host):
-            self.reply(403, {"error": "อนุญาตเฉพาะคำขอจากแอปในเครื่อง"})
+        hosts = self.headers.get_all("Host", [])
+        origins = self.headers.get_all("Origin", [])
+        expected = self.server.origins.get(hosts[0].lower()) if len(hosts) == 1 else None
+        if expected is None or (write and origins != [expected] and (origins or self.server.proxy_origin)):
+            self.reply(403, {"error": "กรุณาเปิดแอปจากที่อยู่ที่ตั้งค่าไว้"})
             return False
         return True
 
@@ -157,15 +229,25 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--open", action="store_true", help="Open the local dashboard in a browser")
+    parser.add_argument("--bind", default="127.0.0.1", help="Loopback or exact private LAN IPv4 address")
+    parser.add_argument("--name", help="Mac .local hostname on the direct listener")
+    parser.add_argument("--tls-cert", help="PEM certificate chain for the private HTTPS listener")
+    parser.add_argument("--tls-key", help="PEM private key for the private HTTPS listener")
+    parser.add_argument("--proxy-origin", help="Exact external HTTPS origin for a loopback-only Tailscale Serve backend")
+    parser.add_argument("--open", action="store_true", help="Open the dashboard in a browser")
     args = parser.parse_args()
     password, path = load_password()
-    with DeskServer(args.port, password) as httpd:
-        print(f"Price Action Desk  http://127.0.0.1:{httpd.server_port}", flush=True)
+    try:
+        server = DeskServer(args.port, password, bind=args.bind, name=args.name,
+                            tls_cert=args.tls_cert, tls_key=args.tls_key, proxy_origin=args.proxy_origin)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+    with server as httpd:
+        print(f"Price Action Desk  {httpd.url}", flush=True)
         print(f"Password file  {path}" if path else "Password from PRICE_DESK_PASSWORD", flush=True)
         if args.open:
             import webbrowser
-            webbrowser.open(f"http://127.0.0.1:{httpd.server_port}")
+            webbrowser.open(httpd.url)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

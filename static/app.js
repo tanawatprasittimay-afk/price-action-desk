@@ -66,7 +66,8 @@ function showLogin(message = '') {
   loggedIn = false; clearSelection(); clearInterval(polling); polling = null;
   $('startup').hidden = $('desk').hidden = $('logout').hidden = $('nav').hidden = true;
   $('login').hidden = false; $('password').value = ''; put('login-error', message);
-  $('csv-file').value = ''; $('password').focus();
+  $('csv-file').value = '';
+  if (window.matchMedia('(pointer: fine)').matches) $('password').focus();
 }
 function configureSource() {
   $('import-form').hidden = mode !== 'import'; $('refresh').hidden = mode === 'import';

@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 *.log
 password.txt
+*.key
+*.pem
+*.cer
+phone-vpn.lock

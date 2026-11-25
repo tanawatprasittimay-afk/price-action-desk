@@ -64,3 +64,6 @@ footer{border-top:1px solid var(--line);margin-top:36px;padding-top:15px;padding
 .import-form{margin-bottom:14px}.import-form .fields{margin-top:0}.import-form p{margin:9px 0}.import-form input[type=file]{min-width:0}
 @media(min-width:731px) and (max-width:990px){.filters{flex-wrap:wrap}}
 .bar-inspector{padding:8px 0;margin-top:2px;display:flex;align-items:baseline;flex-wrap:wrap;gap:3px 9px;font-size:12px}.bar-inspector strong{color:var(--fg)}.bar-inspector span{color:var(--muted)}
+
+/* Keep iOS input focus at the layout scale, including Home Screen launches. */
+@media (pointer:coarse){input,select{font-size:16px}}
